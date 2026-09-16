@@ -142,6 +142,9 @@ export default {
         if (path === '/' || path === '') {
           return makeHtmlResponse(getSetupPage(token, 'Backend server is offline. Enter the current tunnel URL.'));
         }
+        if (path.startsWith('/api/')) {
+          return jsonResp({ error: 'Backend server is offline', code: 'BACKEND_OFFLINE' }, 502);
+        }
         return makeHtmlResponse(getErrorPage('Server Offline', 'The backend server is unreachable.', 'Try again', '/'), 502);
       }
 
