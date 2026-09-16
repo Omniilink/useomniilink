@@ -32,6 +32,30 @@ function makeHtmlResponse(html, status = 200) {
   });
 }
 
+function generateApiKey() {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let key = 'ml-';
+  for (let i = 0; i < 48; i++) {
+    key += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return key;
+}
+
+async function getUserIdFromSession(env, request) {
+  const token = getCookie(request, 'omnilink_token') || request.headers.get('Authorization')?.replace('Bearer ', '');
+  if (!token) return null;
+  const session = await env.DB.prepare(
+    'SELECT user_id FROM sessions WHERE token = ? AND expires_at > datetime(\'now\')'
+  ).bind(token).first();
+  return session ? session.user_id : null;
+}
+
+async function getUserProviderKeys(env, userId) {
+  const keys = await env.DB.prepare('SELECT provider, api_key FROM user_api_keys WHERE user_id = ?')
+    .bind(userId).all();
+  return Object.fromEntries(keys.results.map(k => [k.provider, k.api_key]));
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -42,6 +66,7 @@ export default {
     }
 
     try {
+      // --- Auth endpoints ---
       if (path === '/api/auth' && request.method === 'POST') {
         const { token } = await request.json();
         if (!token) return jsonResp({ error: 'Token required' }, 400);
@@ -78,36 +103,111 @@ export default {
         const backendUrl = backendSetting?.value;
         if (!backendUrl) return jsonResp({ status: 'no_backend', backendUrl: null, healthy: false }, 200);
         try {
-          const resp = await fetch(backendUrl, { method: 'HEAD', signal: AbortSignal.timeout(5000) });
+          const resp = await fetch(backendUrl + '/api/status', { method: 'GET', signal: AbortSignal.timeout(5000) });
           return jsonResp({ status: 'ok', backendUrl, healthy: resp.ok, code: resp.status }, 200);
         } catch (e) {
           return jsonResp({ status: 'unreachable', backendUrl, healthy: false, error: e.message }, 200);
         }
       }
 
-      const token = getCookie(request, 'omnilink_token') || url.searchParams.get('token');
-      if (!token) {
-        return makeHtmlResponse(getAuthPage());
+      // --- API Key management (requires session auth) ---
+      if (path === '/api/keys' && request.method === 'GET') {
+        const userId = await getUserIdFromSession(env, request);
+        if (!userId) return jsonResp({ error: 'Unauthorized' }, 401);
+        const keys = await env.DB.prepare('SELECT id, key, name, created_at, last_used_at, request_count FROM api_keys WHERE user_id = ?')
+          .bind(userId).all();
+        return jsonResp({ keys: keys.results }, 200);
       }
 
-      const session = await env.DB.prepare(
-        'SELECT user_id FROM sessions WHERE token = ? AND expires_at > datetime(\'now\')'
-      ).bind(token).first();
-      if (!session) {
-        return makeHtmlResponse(getAuthPage('Session expired. Please sign in again.'));
+      if (path === '/api/keys/generate' && request.method === 'POST') {
+        const userId = await getUserIdFromSession(env, request);
+        if (!userId) return jsonResp({ error: 'Unauthorized' }, 401);
+        const body = await request.json().catch(() => ({}));
+        const key = generateApiKey();
+        const name = body.name || 'API Key';
+        await env.DB.prepare('INSERT INTO api_keys (user_id, key, name) VALUES (?, ?, ?)')
+          .bind(userId, key, name).run();
+        return jsonResp({ key, name }, 200);
       }
 
-      const keys = await env.DB.prepare('SELECT provider, api_key FROM user_api_keys WHERE user_id = ?')
-        .bind(session.user_id).all();
+      if (path === '/api/keys/revoke' && request.method === 'POST') {
+        const userId = await getUserIdFromSession(env, request);
+        if (!userId) return jsonResp({ error: 'Unauthorized' }, 401);
+        const body = await request.json();
+        if (!body.key) return jsonResp({ error: 'Key required' }, 400);
+        await env.DB.prepare('DELETE FROM api_keys WHERE user_id = ? AND key = ?')
+          .bind(userId, body.key).run();
+        return jsonResp({ success: true }, 200);
+      }
+
+      // --- Determine auth method ---
+      const isApiPath = path.startsWith('/v1/') || path.startsWith('/api/');
+      let userId = null;
+      let authMethod = null;
+
+      // 1. Try permanent API key first (for /v1/* paths)
+      const authHeader = request.headers.get('Authorization');
+      if (authHeader && authHeader.startsWith('Bearer ml-')) {
+        const apiKey = authHeader.slice(7);
+        const keyRecord = await env.DB.prepare('SELECT user_id FROM api_keys WHERE key = ?').bind(apiKey).first();
+        if (keyRecord) {
+          userId = keyRecord.user_id;
+          authMethod = 'api_key';
+          await env.DB.prepare('UPDATE api_keys SET last_used_at = datetime(\'now\'), request_count = request_count + 1 WHERE key = ?')
+            .bind(apiKey).run();
+        } else {
+          if (isApiPath) return jsonResp({ error: 'Invalid API key' }, 401);
+          return makeHtmlResponse(getAuthPage('Invalid API key.'));
+        }
+      }
+
+      // 2. Try session token (cookie or query param or Bearer)
+      if (!userId) {
+        const token = getCookie(request, 'omnilink_token') || url.searchParams.get('token')
+          || (authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null);
+        if (!token) {
+          if (isApiPath) return jsonResp({ error: 'Authentication required. Send Authorization: Bearer <api_key_or_session_token>' }, 401);
+          return makeHtmlResponse(getAuthPage());
+        }
+        const session = await env.DB.prepare(
+          'SELECT user_id FROM sessions WHERE token = ? AND expires_at > datetime(\'now\')'
+        ).bind(token).first();
+        if (!session) {
+          if (isApiPath) return jsonResp({ error: 'Invalid or expired token' }, 401);
+          return makeHtmlResponse(getAuthPage('Session expired. Please sign in again.'));
+        }
+        userId = session.user_id;
+        authMethod = 'session';
+      }
+
+      const cookieHeader = `omnilink_token=${getCookie(request, 'omnilink_token') || ''}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`;
+      const hasCookie = getCookie(request, 'omnilink_token');
+
+      // Get user's provider keys
+      const dbKeys = await getUserProviderKeys(env, userId);
+
       const backendSetting = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind('backend_url').first();
       const backendUrl = backendSetting?.value;
 
       if (!backendUrl) {
-        return makeHtmlResponse(getSetupPage(token));
+        if (isApiPath) return jsonResp({ error: 'No backend configured', code: 'NO_BACKEND' }, 503);
+        const resp = makeHtmlResponse(getSetupPage(''));
+        if (!hasCookie) resp.headers.append('Set-Cookie', cookieHeader);
+        return resp;
       }
 
-      const apiKeys = Object.fromEntries(keys.results.map(k => [k.provider, k.api_key]));
+      // Merge: frontend-sent keys take priority, then D1 keys
+      const frontendUserKeys = request.headers.get('X-User-Keys');
+      let finalUserKeys;
+      if (frontendUserKeys) {
+        try { finalUserKeys = frontendUserKeys; } catch(e) { finalUserKeys = JSON.stringify(dbKeys); }
+      } else if (Object.keys(dbKeys).length > 0) {
+        finalUserKeys = JSON.stringify(dbKeys);
+      } else {
+        finalUserKeys = null;
+      }
 
+      // Build proxy request
       const tunnelBase = new URL(backendUrl);
       const tunnelUrl = new URL(request.url);
       tunnelUrl.hostname = tunnelBase.hostname;
@@ -126,7 +226,7 @@ export default {
         }
       }
       proxyHeaders.set('Host', tunnelBase.hostname);
-      proxyHeaders.set('X-User-Keys', JSON.stringify(apiKeys));
+      if (finalUserKeys) proxyHeaders.set('X-User-Keys', finalUserKeys);
 
       const proxyReq = new Request(tunnelUrl.toString(), {
         method: request.method,
@@ -140,12 +240,18 @@ export default {
         resp = await fetch(proxyReq, { signal: AbortSignal.timeout(30000) });
       } catch (e) {
         if (path === '/' || path === '') {
-          return makeHtmlResponse(getSetupPage(token, 'Backend server is offline. Enter the current tunnel URL.'));
+          const errResp = makeHtmlResponse(getSetupPage('Backend server is offline. Enter the current tunnel URL.'));
+          if (!hasCookie) errResp.headers.append('Set-Cookie', cookieHeader);
+          return errResp;
         }
-        if (path.startsWith('/api/')) {
-          return jsonResp({ error: 'Backend server is offline', code: 'BACKEND_OFFLINE' }, 502);
+        if (isApiPath) {
+          const errResp = jsonResp({ error: 'Backend server is offline', code: 'BACKEND_OFFLINE' }, 502);
+          if (!hasCookie) errResp.headers.append('Set-Cookie', cookieHeader);
+          return errResp;
         }
-        return makeHtmlResponse(getErrorPage('Server Offline', 'The backend server is unreachable.', 'Try again', '/'), 502);
+        const errResp = makeHtmlResponse(getErrorPage('Server Offline', 'The backend server is unreachable.', 'Try again', '/'), 502);
+        if (!hasCookie) errResp.headers.append('Set-Cookie', cookieHeader);
+        return errResp;
       }
 
       const contentType = resp.headers.get('Content-Type') || '';
@@ -153,8 +259,9 @@ export default {
       if (contentType.includes('text/html')) {
         let html = await resp.text();
         const injection = `window.__OMNILINK_TUNNEL=${JSON.stringify(backendUrl)};`;
-        if (html.includes('const API = \'\';')) {
+        if (html.includes('const API = \'\';') || html.includes("const API='';")) {
           html = html.replace("const API = '';", `const API = ''; ${injection}`);
+          html = html.replace("const API='';", `const API=''; ${injection}`);
         } else if (html.includes('</head>')) {
           html = html.replace('</head>', `<script>${injection}</script></head>`);
         } else if (html.includes('</body>')) {
@@ -165,6 +272,7 @@ export default {
         const newHeaders = new Headers();
         newHeaders.set('Content-Type', 'text/html;charset=utf-8');
         newHeaders.set('Access-Control-Allow-Origin', '*');
+        if (!hasCookie) newHeaders.append('Set-Cookie', cookieHeader);
         return new Response(html, { status: resp.status, headers: newHeaders });
       }
 
@@ -173,6 +281,7 @@ export default {
       newHeaders.delete('content-security-policy');
       newHeaders.delete('x-frame-options');
       newHeaders.delete('x-content-security-policy');
+      if (!hasCookie) newHeaders.append('Set-Cookie', cookieHeader);
 
       return new Response(resp.body, {
         status: resp.status,
@@ -185,7 +294,7 @@ export default {
   },
 };
 
-function getSetupPage(token, error) {
+function getSetupPage(error) {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -245,7 +354,7 @@ async function save(){
   if(!u){msg.textContent='Please enter a URL';msg.className='msg msg-err';return}
   btn.disabled=true;btn.textContent='Connecting\u2026';msg.textContent='';
   try{
-    var r=await fetch('/api/set-backend',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+${JSON.stringify(token)}},body:JSON.stringify({backendUrl:u})});
+    var r=await fetch('/api/set-backend',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({backendUrl:u})});
     var d=await r.json();
     if(d.success){msg.textContent='Connected! Redirecting\u2026';msg.className='msg msg-ok';setTimeout(function(){window.location.href='/'},1000)}
     else{msg.textContent=d.error||'Failed';msg.className='msg msg-err'}
