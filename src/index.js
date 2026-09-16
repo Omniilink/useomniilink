@@ -1,157 +1,13 @@
-// OmniLink Use Worker - useomniilink.omniilink.workers.dev
+// Omniilink Use Worker - useomniilink.omniilink.workers.dev
 // Auth gate + reverse proxy to ProDesk tunnel
 
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-User-Keys',
-    };
-
-    if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: corsHeaders });
-    }
-
-    try {
-      // Auth endpoints
-      if (path === '/api/auth' && request.method === 'POST') {
-        const { token } = await request.json();
-        const session = await env.DB.prepare(
-          'SELECT user_id FROM sessions WHERE token = ? AND expires_at > datetime(\'now\')'
-        ).bind(token).first();
-        if (!session) return jsonResp({ error: 'Invalid session' }, 401, corsHeaders);
-        const keys = await env.DB.prepare('SELECT provider, api_key FROM user_api_keys WHERE user_id = ?')
-          .bind(session.user_id).all();
-        const backendSetting = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind('backend_url').first();
-        return jsonResp({
-          valid: true,
-          apiKeys: Object.fromEntries(keys.results.map(k => [k.provider, k.api_key])),
-          backendUrl: backendSetting?.value || '',
-        }, 200, corsHeaders);
-      }
-
-      if (path === '/api/set-backend' && request.method === 'POST') {
-        const authHeader = request.headers.get('Authorization');
-        if (!authHeader || !authHeader.startsWith('Bearer ')) return jsonResp({ error: 'Unauthorized' }, 401, corsHeaders);
-        const token = authHeader.slice(7);
-        const session = await env.DB.prepare(
-          'SELECT user_id FROM sessions WHERE token = ? AND expires_at > datetime(\'now\')'
-        ).bind(token).first();
-        if (!session) return jsonResp({ error: 'Invalid session' }, 401, corsHeaders);
-        const { backendUrl } = await request.json();
-        if (!backendUrl || !backendUrl.startsWith('https://')) return jsonResp({ error: 'Invalid URL' }, 400, corsHeaders);
-        await env.DB.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').bind('backend_url', backendUrl).run();
-        return jsonResp({ success: true }, 200, corsHeaders);
-      }
-
-      // All other routes: require auth token
-      const token = getCookie(request, 'omnilink_token') || url.searchParams.get('token');
-      if (!token) {
-        return new Response(getAuthPage(), {
-          headers: { 'Content-Type': 'text/html;charset=utf-8', ...corsHeaders },
-        });
-      }
-
-      const session = await env.DB.prepare(
-        'SELECT user_id FROM sessions WHERE token = ? AND expires_at > datetime(\'now\')'
-      ).bind(token).first();
-      if (!session) {
-        return new Response(getAuthPage('Session expired. Please sign in again.'), {
-          headers: { 'Content-Type': 'text/html;charset=utf-8', ...corsHeaders },
-        });
-      }
-
-      const keys = await env.DB.prepare('SELECT provider, api_key FROM user_api_keys WHERE user_id = ?')
-        .bind(session.user_id).all();
-      const backendSetting = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind('backend_url').first();
-      const backendUrl = backendSetting?.value;
-
-      if (!backendUrl) {
-        return new Response(getSetupPage(token), {
-          headers: { 'Content-Type': 'text/html;charset=utf-8', ...corsHeaders },
-        });
-      }
-
-      // If just the root path, try to proxy (will fail if backend is down, that's fine)
-      const apiKeys = Object.fromEntries(keys.results.map(k => [k.provider, k.api_key]));
-
-      // Build proxy request
-      const tunnelBase = new URL(backendUrl);
-      const tunnelUrl = new URL(request.url);
-      tunnelUrl.hostname = tunnelBase.hostname;
-      tunnelUrl.protocol = 'https:';
-      tunnelUrl.port = '';
-      tunnelUrl.searchParams.delete('token');
-
-      const proxyHeaders = new Headers();
-      for (const [key, value] of request.headers) {
-        const lower = key.toLowerCase();
-        if (lower !== 'host' && lower !== 'cf-connecting-ip' && lower !== 'cf-ipcountry' && lower !== 'cf-ray' && lower !== 'cf-visitor') {
-          proxyHeaders.set(key, value);
-        }
-      }
-      proxyHeaders.set('Host', tunnelBase.hostname);
-      proxyHeaders.set('X-User-Keys', JSON.stringify(apiKeys));
-
-      const proxyReq = new Request(tunnelUrl.toString(), {
-        method: request.method,
-        headers: proxyHeaders,
-        body: request.body,
-        redirect: 'follow',
-      });
-
-      let resp;
-      try {
-        resp = await fetch(proxyReq, { signal: AbortSignal.timeout(30000) });
-      } catch (e) {
-        // Backend unreachable - show setup page for root, error for API
-        if (path === '/' || path === '') {
-          return new Response(getSetupPage(token, 'ProDesk server is offline. Enter the current tunnel URL.'), {
-            headers: { 'Content-Type': 'text/html;charset=utf-8', ...corsHeaders },
-          });
-        }
-        return jsonResp({ error: 'Backend server is offline' }, 502, corsHeaders);
-      }
-
-      const contentType = resp.headers.get('Content-Type') || '';
-
-      // For HTML responses, inject tunnel URL info
-      if (contentType.includes('text/html')) {
-        let html = await resp.text();
-        html = html.replace(
-          "const API = '';",
-          `const API = ''; window.__OMNILINK_TUNNEL = ${JSON.stringify(backendUrl)};`
-        );
-        const newRespHeaders = new Headers();
-        newRespHeaders.set('Content-Type', 'text/html;charset=utf-8');
-        newRespHeaders.set('Access-Control-Allow-Origin', '*');
-        return new Response(html, { status: resp.status, headers: newRespHeaders });
-      }
-
-      // For all other responses (API, SSE, etc.), pass through directly
-      const newHeaders = new Headers(resp.headers);
-      newHeaders.set('Access-Control-Allow-Origin', '*');
-      newHeaders.delete('content-security-policy');
-      newHeaders.delete('x-frame-options');
-
-      return new Response(resp.body, {
-        status: resp.status,
-        statusText: resp.statusText,
-        headers: newHeaders,
-      });
-    } catch (err) {
-      return new Response(getErrorPage('Error', 'Something went wrong.'), {
-        headers: { 'Content-Type': 'text/html;charset=utf-8', ...corsHeaders },
-      });
-    }
-  },
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-User-Keys',
 };
 
-function jsonResp(data, status, corsHeaders) {
+function jsonResp(data, status) {
   return new Response(JSON.stringify(data), {
     status,
     headers: { 'Content-Type': 'application/json', ...corsHeaders },
@@ -169,81 +25,231 @@ function escapeHtml(str) {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
+function makeHtmlResponse(html, status = 200) {
+  return new Response(html, {
+    status,
+    headers: { 'Content-Type': 'text/html;charset=utf-8', ...corsHeaders },
+  });
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: corsHeaders });
+    }
+
+    try {
+      if (path === '/api/auth' && request.method === 'POST') {
+        const { token } = await request.json();
+        if (!token) return jsonResp({ error: 'Token required' }, 400);
+        const session = await env.DB.prepare(
+          'SELECT user_id FROM sessions WHERE token = ? AND expires_at > datetime(\'now\')'
+        ).bind(token).first();
+        if (!session) return jsonResp({ error: 'Invalid session' }, 401);
+        const keys = await env.DB.prepare('SELECT provider, api_key FROM user_api_keys WHERE user_id = ?')
+          .bind(session.user_id).all();
+        const backendSetting = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind('backend_url').first();
+        return jsonResp({
+          valid: true,
+          apiKeys: Object.fromEntries(keys.results.map(k => [k.provider, k.api_key])),
+          backendUrl: backendSetting?.value || '',
+        }, 200);
+      }
+
+      if (path === '/api/set-backend' && request.method === 'POST') {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader || !authHeader.startsWith('Bearer ')) return jsonResp({ error: 'Unauthorized' }, 401);
+        const token = authHeader.slice(7);
+        const session = await env.DB.prepare(
+          'SELECT user_id FROM sessions WHERE token = ? AND expires_at > datetime(\'now\')'
+        ).bind(token).first();
+        if (!session) return jsonResp({ error: 'Invalid session' }, 401);
+        const { backendUrl } = await request.json();
+        if (!backendUrl || !backendUrl.startsWith('https://')) return jsonResp({ error: 'Invalid URL. Must start with https://' }, 400);
+        await env.DB.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').bind('backend_url', backendUrl).run();
+        return jsonResp({ success: true }, 200);
+      }
+
+      if (path === '/api/health') {
+        const backendSetting = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind('backend_url').first();
+        const backendUrl = backendSetting?.value;
+        if (!backendUrl) return jsonResp({ status: 'no_backend', backendUrl: null, healthy: false }, 200);
+        try {
+          const resp = await fetch(backendUrl, { method: 'HEAD', signal: AbortSignal.timeout(5000) });
+          return jsonResp({ status: 'ok', backendUrl, healthy: resp.ok, code: resp.status }, 200);
+        } catch (e) {
+          return jsonResp({ status: 'unreachable', backendUrl, healthy: false, error: e.message }, 200);
+        }
+      }
+
+      const token = getCookie(request, 'omnilink_token') || url.searchParams.get('token');
+      if (!token) {
+        return makeHtmlResponse(getAuthPage());
+      }
+
+      const session = await env.DB.prepare(
+        'SELECT user_id FROM sessions WHERE token = ? AND expires_at > datetime(\'now\')'
+      ).bind(token).first();
+      if (!session) {
+        return makeHtmlResponse(getAuthPage('Session expired. Please sign in again.'));
+      }
+
+      const keys = await env.DB.prepare('SELECT provider, api_key FROM user_api_keys WHERE user_id = ?')
+        .bind(session.user_id).all();
+      const backendSetting = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind('backend_url').first();
+      const backendUrl = backendSetting?.value;
+
+      if (!backendUrl) {
+        return makeHtmlResponse(getSetupPage(token));
+      }
+
+      const apiKeys = Object.fromEntries(keys.results.map(k => [k.provider, k.api_key]));
+
+      const tunnelBase = new URL(backendUrl);
+      const tunnelUrl = new URL(request.url);
+      tunnelUrl.hostname = tunnelBase.hostname;
+      tunnelUrl.protocol = 'https:';
+      tunnelUrl.port = '';
+      tunnelUrl.searchParams.delete('token');
+
+      const proxyHeaders = new Headers();
+      const skipHeaders = new Set([
+        'host', 'cf-connecting-ip', 'cf-ipcountry', 'cf-ray', 'cf-visitor',
+        'cf-worker', 'x-forwarded-for', 'x-forwarded-proto', 'x-real-ip',
+      ]);
+      for (const [key, value] of request.headers) {
+        if (!skipHeaders.has(key.toLowerCase())) {
+          proxyHeaders.set(key, value);
+        }
+      }
+      proxyHeaders.set('Host', tunnelBase.hostname);
+      proxyHeaders.set('X-User-Keys', JSON.stringify(apiKeys));
+
+      const proxyReq = new Request(tunnelUrl.toString(), {
+        method: request.method,
+        headers: proxyHeaders,
+        body: request.body,
+        redirect: 'follow',
+      });
+
+      let resp;
+      try {
+        resp = await fetch(proxyReq, { signal: AbortSignal.timeout(30000) });
+      } catch (e) {
+        if (path === '/' || path === '') {
+          return makeHtmlResponse(getSetupPage(token, 'Backend server is offline. Enter the current tunnel URL.'));
+        }
+        return makeHtmlResponse(getErrorPage('Server Offline', 'The backend server is unreachable.', 'Try again', '/'), 502);
+      }
+
+      const contentType = resp.headers.get('Content-Type') || '';
+
+      if (contentType.includes('text/html')) {
+        let html = await resp.text();
+        const injection = `window.__OMNILINK_TUNNEL=${JSON.stringify(backendUrl)};`;
+        if (html.includes('const API = \'\';')) {
+          html = html.replace("const API = '';", `const API = ''; ${injection}`);
+        } else if (html.includes('</head>')) {
+          html = html.replace('</head>', `<script>${injection}</script></head>`);
+        } else if (html.includes('</body>')) {
+          html = html.replace('</body>', `<script>${injection}</script></body>`);
+        } else {
+          html = `<script>${injection}</script>${html}`;
+        }
+        const newHeaders = new Headers();
+        newHeaders.set('Content-Type', 'text/html;charset=utf-8');
+        newHeaders.set('Access-Control-Allow-Origin', '*');
+        return new Response(html, { status: resp.status, headers: newHeaders });
+      }
+
+      const newHeaders = new Headers(resp.headers);
+      newHeaders.set('Access-Control-Allow-Origin', '*');
+      newHeaders.delete('content-security-policy');
+      newHeaders.delete('x-frame-options');
+      newHeaders.delete('x-content-security-policy');
+
+      return new Response(resp.body, {
+        status: resp.status,
+        statusText: resp.statusText,
+        headers: newHeaders,
+      });
+    } catch (err) {
+      return makeHtmlResponse(getErrorPage('Something Went Wrong', 'An unexpected error occurred. Please try again.'), 500);
+    }
+  },
+};
+
 function getSetupPage(token, error) {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>OmniLink - Setup</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Omniilink - Setup</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#09090b;--bg2:#111113;--border:#27272a;--text:#fafafa;--text2:#a1a1aa;--accent:#2563eb;--accent2:#3b82f6;--radius:10px}
-body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:20px;padding:20px env(safe-area-inset-right,20px) env(safe-area-inset-bottom,20px) env(safe-area-inset-left,20px)}
-.box{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:32px;max-width:440px;width:100%}
-.logo{display:flex;align-items:center;gap:10px;justify-content:center;margin-bottom:24px}
-.logo svg{width:28px;height:28px}
-.logo span{font-size:20px;font-weight:700}
-h2{font-size:18px;margin-bottom:8px;text-align:center}
-p{color:var(--text2);font-size:14px;margin-bottom:16px;text-align:center}
-.err{background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px;color:#ef4444;font-size:13px;margin-bottom:16px}
-.input-group{display:flex;gap:8px;margin-bottom:16px}
-input{flex:1;padding:10px 14px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:14px;outline:none}
-input:focus{border-color:var(--accent)}
-.btn{padding:10px 20px;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;background:var(--accent);color:#fff;white-space:nowrap}
-.btn:hover{background:var(--accent2)}
-.btn:disabled{opacity:0.5;cursor:not-allowed}
-.status{font-size:12px;color:var(--text2);text-align:center;margin-top:8px}
-.status.ok{color:#22c55e}
-.status.err2{color:#ef4444}
-.help-link{display:block;text-align:center;margin-top:16px;color:var(--text2);font-size:13px;text-decoration:none}
-.help-link:hover{color:var(--accent)}
-@media(max-width:480px){.box{padding:24px 16px}.input-group{flex-direction:column}}
+:root{--bg:#0a0a0c;--surface:#111114;--border:#232328;--text:#f0f0f4;--muted:#8e8e96;--accent:#3b6df5;--accent-hover:#4d7df6;--error:#e54545;--error-bg:rgba(229,69,69,0.08);--error-border:rgba(229,69,69,0.25);--success:#2dba4e;--radius:12px;--shadow:0 4px 24px rgba(0,0,0,0.4)}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:24px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:40px 32px;max-width:420px;width:100%;box-shadow:var(--shadow)}
+.header{text-align:center;margin-bottom:28px}
+.logo{display:inline-flex;align-items:center;gap:10px;margin-bottom:16px}
+.logo-icon{width:36px;height:36px;border-radius:10px;background:var(--accent);display:flex;align-items:center;justify-content:center}
+.logo-icon svg{width:20px;height:20px}
+.logo-text{font-size:22px;font-weight:700;letter-spacing:-0.3px}
+.header p{color:var(--muted);font-size:14px;line-height:1.5}
+.alert-error{background:var(--error-bg);border:1px solid var(--error-border);border-radius:8px;padding:12px 14px;color:var(--error);font-size:13px;margin-bottom:20px}
+.field{display:flex;gap:8px;margin-bottom:16px}
+input[type=url]{flex:1;padding:11px 14px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:14px;outline:none;transition:border-color .15s}
+input[type=url]::placeholder{color:#555}
+input[type=url]:focus{border-color:var(--accent)}
+.btn{padding:11px 22px;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:background .15s}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:var(--accent-hover)}
+.btn-primary:disabled{opacity:.5;cursor:not-allowed}
+.msg{font-size:13px;text-align:center;margin-top:10px;min-height:18px}
+.msg-ok{color:var(--success)}
+.msg-err{color:var(--error)}
+.footer{text-align:center;margin-top:20px}
+.footer a{color:var(--muted);font-size:13px;text-decoration:none;transition:color .15s}
+.footer a:hover{color:var(--accent)}
+@media(max-width:480px){.card{padding:28px 20px}.field{flex-direction:column}}
 </style>
 </head>
 <body>
-<div class="box">
-  <div class="logo">
-    <svg viewBox="0 0 24 24" fill="none"><rect width="24" height="24" rx="6" fill="#2563eb"/><path d="M7 8h10M7 12h10M7 16h6" stroke="#fff" stroke-width="2" stroke-linecap="round"/></svg>
-    <span>OmniLink</span>
+<div class="card">
+  <div class="header">
+    <div class="logo">
+      <div class="logo-icon"><svg viewBox="0 0 24 24" fill="none"><rect width="24" height="24" rx="6" fill="#3b6df5"/><path d="M7 8h10M7 12h10M7 16h6" stroke="#fff" stroke-width="2" stroke-linecap="round"/></svg></div>
+      <span class="logo-text">Omniilink</span>
+    </div>
+    <p>Enter your ProDesk tunnel URL to connect to your server.</p>
   </div>
-  <h2>Connect to Server</h2>
-  <p>Enter your ProDesk tunnel URL to start using OmniLink.</p>
-  ${error ? '<div class="err">' + escapeHtml(error) + '</div>' : ''}
-  <div class="input-group">
-    <input type="url" id="url-input" placeholder="https://something.trycloudflare.com">
-    <button class="btn" id="save-btn" onclick="saveUrl()">Connect</button>
+  ${error ? '<div class="alert-error">' + escapeHtml(error) + '</div>' : ''}
+  <div class="field">
+    <input type="url" id="url" placeholder="https://example.trycloudflare.com">
+    <button class="btn btn-primary" id="btn" onclick="save()">Connect</button>
   </div>
-  <div class="status" id="status"></div>
-  <a class="help-link" href="https://signupomniilink.omniilink.workers.dev">Back to Sign In</a>
+  <div class="msg" id="msg"></div>
+  <div class="footer"><a href="https://signupomniilink.omniilink.workers.dev">Back to Sign In</a></div>
 </div>
 <script>
-async function saveUrl() {
-  const btn = document.getElementById('save-btn');
-  const input = document.getElementById('url-input');
-  const status = document.getElementById('status');
-  const url = input.value.trim();
-  if (!url) { status.textContent = 'Please enter a URL'; status.className = 'status err2'; return; }
-  btn.disabled = true; btn.textContent = 'Connecting...';
-  try {
-    const r = await fetch('/api/set-backend', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ${token}' },
-      body: JSON.stringify({ backendUrl: url })
-    });
-    const data = await r.json();
-    if (data.success) {
-      status.textContent = 'Saved! Redirecting...'; status.className = 'status ok';
-      setTimeout(() => { window.location.href = '/'; }, 1000);
-    } else {
-      status.textContent = data.error || 'Failed to save'; status.className = 'status err2';
-    }
-  } catch(e) {
-    status.textContent = 'Error: ' + e.message; status.className = 'status err2';
-  }
-  btn.disabled = false; btn.textContent = 'Connect';
+async function save(){
+  var btn=document.getElementById('btn'),input=document.getElementById('url'),msg=document.getElementById('msg');
+  var u=input.value.trim();
+  if(!u){msg.textContent='Please enter a URL';msg.className='msg msg-err';return}
+  btn.disabled=true;btn.textContent='Connecting\u2026';msg.textContent='';
+  try{
+    var r=await fetch('/api/set-backend',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+${JSON.stringify(token)}},body:JSON.stringify({backendUrl:u})});
+    var d=await r.json();
+    if(d.success){msg.textContent='Connected! Redirecting\u2026';msg.className='msg msg-ok';setTimeout(function(){window.location.href='/'},1000)}
+    else{msg.textContent=d.error||'Failed';msg.className='msg msg-err'}
+  }catch(e){msg.textContent='Network error';msg.className='msg msg-err'}
+  btn.disabled=false;btn.textContent='Connect';
 }
-document.getElementById('url-input').addEventListener('keydown', e => { if (e.key === 'Enter') saveUrl(); });
+document.getElementById('url').addEventListener('keydown',function(e){if(e.key==='Enter')save()});
 </script>
 </body>
 </html>`;
@@ -254,63 +260,71 @@ function getAuthPage(error) {
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>OmniLink - Sign In</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Omniilink - Sign In</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#09090b;--bg2:#111113;--border:#27272a;--text:#fafafa;--text2:#a1a1aa;--accent:#2563eb;--accent2:#3b82f6;--radius:10px}
-body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:20px;padding:20px env(safe-area-inset-right,20px) env(safe-area-inset-bottom,20px) env(safe-area-inset-left,20px)}
-.box{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:32px;max-width:400px;width:100%;text-align:center}
-.logo{display:flex;align-items:center;gap:10px;justify-content:center;margin-bottom:16px}
-.logo svg{width:32px;height:32px}
-.logo span{font-size:20px;font-weight:700}
-.box h2{margin-bottom:8px}
-.box p{color:var(--text2);font-size:14px;margin-bottom:16px}
-.btn{padding:10px 20px;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;background:var(--accent);color:#fff;text-decoration:none;display:inline-block}
-.btn:hover{background:var(--accent2)}
-.err{color:#ef4444;font-size:13px;margin-bottom:12px}
-.links{margin-top:16px;font-size:13px;color:var(--text2)}
-.links a{color:var(--accent);cursor:pointer;text-decoration:none}
+:root{--bg:#0a0a0c;--surface:#111114;--border:#232328;--text:#f0f0f4;--muted:#8e8e96;--accent:#3b6df5;--accent-hover:#4d7df6;--error:#e54545;--error-bg:rgba(229,69,69,0.08);--error-border:rgba(229,69,69,0.25);--radius:12px;--shadow:0 4px 24px rgba(0,0,0,0.4)}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:24px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:40px 32px;max-width:380px;width:100%;text-align:center;box-shadow:var(--shadow)}
+.logo{display:inline-flex;align-items:center;gap:10px;margin-bottom:20px}
+.logo-icon{width:40px;height:40px;border-radius:10px;background:var(--accent);display:flex;align-items:center;justify-content:center}
+.logo-icon svg{width:22px;height:22px}
+.logo-text{font-size:24px;font-weight:700;letter-spacing:-0.3px}
+.card h1{font-size:20px;margin-bottom:8px;font-weight:600}
+.card p{color:var(--muted);font-size:14px;line-height:1.5;margin-bottom:20px}
+.alert-error{background:var(--error-bg);border:1px solid var(--error-border);border-radius:8px;padding:12px 14px;color:var(--error);font-size:13px;margin-bottom:20px}
+.btn{display:inline-block;padding:12px 28px;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;text-decoration:none;transition:background .15s}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:var(--accent-hover)}
+.links{margin-top:20px;font-size:13px;color:var(--muted)}
+.links a{color:var(--accent);text-decoration:none;transition:color .15s}
+.links a:hover{color:var(--accent-hover)}
 </style>
 </head>
 <body>
-<div class="box">
+<div class="card">
   <div class="logo">
-    <svg viewBox="0 0 24 24" fill="none"><rect width="24" height="24" rx="6" fill="#2563eb"/><path d="M7 8h10M7 12h10M7 16h6" stroke="#fff" stroke-width="2" stroke-linecap="round"/></svg>
-    <span>OmniLink</span>
+    <div class="logo-icon"><svg viewBox="0 0 24 24" fill="none"><rect width="24" height="24" rx="6" fill="#3b6df5"/><path d="M7 8h10M7 12h10M7 16h6" stroke="#fff" stroke-width="2" stroke-linecap="round"/></svg></div>
+    <span class="logo-text">Omniilink</span>
   </div>
-  ${error ? '<p class="err">' + escapeHtml(error) + '</p>' : ''}
-  <p>Sign in to your OmniLink account to continue.</p>
-  <a class="btn" href="https://signupomniilink.omniilink.workers.dev">Sign In</a>
-  <div class="links"><a href="https://signupomniilink.omniilink.workers.dev">Don't have an account? Sign up</a></div>
+  ${error ? '<div class="alert-error">' + escapeHtml(error) + '</div>' : ''}
+  <h1>Welcome back</h1>
+  <p>Sign in to access your Omniilink workspace.</p>
+  <a class="btn btn-primary" href="https://signupomniilink.omniilink.workers.dev">Sign In</a>
+  <div class="links">New here? <a href="https://signupomniilink.omniilink.workers.dev">Create an account</a></div>
 </div>
 </body>
 </html>`;
 }
 
-function getErrorPage(title, msg) {
+function getErrorPage(title, msg, actionText, actionHref) {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OmniLink - Error</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Omniilink - Error</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#09090b;--bg2:#111113;--border:#27272a;--text:#fafafa;--text2:#a1a1aa;--accent:#2563eb;--accent2:#3b82f6;--radius:10px}
-body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);height:100vh;display:flex;align-items:center;justify-content:center}
-.box{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:32px;max-width:400px;text-align:center}
-.box h2{margin-bottom:8px;color:#ef4444}
-.box p{color:var(--text2);font-size:14px;margin-bottom:16px}
-.btn{padding:10px 20px;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;background:var(--accent);color:#fff;text-decoration:none;display:inline-block}
-.btn:hover{background:var(--accent2)}
+:root{--bg:#0a0a0c;--surface:#111114;--border:#232328;--text:#f0f0f4;--muted:#8e8e96;--accent:#3b6df5;--accent-hover:#4d7df6;--error:#e54545;--radius:12px;--shadow:0 4px 24px rgba(0,0,0,0.4)}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:40px 32px;max-width:380px;width:100%;text-align:center;box-shadow:var(--shadow)}
+.icon{width:56px;height:56px;border-radius:50%;background:rgba(229,69,69,0.1);display:inline-flex;align-items:center;justify-content:center;margin-bottom:20px}
+.icon svg{width:28px;height:28px}
+.card h2{font-size:18px;margin-bottom:8px;font-weight:600}
+.card p{color:var(--muted);font-size:14px;line-height:1.5;margin-bottom:24px}
+.btn{display:inline-block;padding:11px 24px;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;text-decoration:none;transition:background .15s}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:var(--accent-hover)}
 </style>
 </head>
 <body>
-<div class="box">
-  <h2>${title}</h2>
-  <p>${msg}</p>
-  <a class="btn" href="/">Try Again</a>
+<div class="card">
+  <div class="icon"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#e54545" stroke-width="2"/><path d="M12 8v5M12 16v.01" stroke="#e54545" stroke-width="2" stroke-linecap="round"/></svg></div>
+  <h2>${escapeHtml(title)}</h2>
+  <p>${escapeHtml(msg)}</p>
+  <a class="btn btn-primary" href="${escapeHtml(actionHref || '/')}">${escapeHtml(actionText || 'Try Again')}</a>
 </div>
 </body>
 </html>`;

@@ -1,5 +1,8 @@
-{
-  "name": "useomniilink",
-  "main": "src/index.js",
-  "compatibility_date": "2024-01-01"
-}
+name = "useomniilink"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "omnilink-db"
+database_id = "3518d698-60d8-4678-844e-6b5b3ba6f852"
