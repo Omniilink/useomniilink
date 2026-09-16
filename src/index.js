@@ -14,6 +14,11 @@ function jsonResp(data, status) {
   });
 }
 
+function parseUserKeys(header) {
+  if (!header) return {};
+  try { return JSON.parse(header); } catch(e) { return {}; }
+}
+
 function getCookie(request, name) {
   const cookie = request.headers.get('Cookie') || '';
   const match = cookie.match(new RegExp(`${name}=([^;]+)`));
@@ -116,7 +121,27 @@ export default {
         if (!userId) return jsonResp({ error: 'Unauthorized' }, 401);
         const keys = await env.DB.prepare('SELECT id, key, name, created_at, last_used_at, request_count FROM api_keys WHERE user_id = ?')
           .bind(userId).all();
-        return jsonResp({ keys: keys.results }, 200);
+
+        const providerDefs = {
+          gemini: { name: 'Google Gemini', env: 'GEMINI_API_KEY', models: 11 },
+          openai: { name: 'OpenAI', env: 'OPENAI_API_KEY', models: 5 },
+          anthropic: { name: 'Anthropic', env: 'ANTHROPIC_API_KEY', models: 5 },
+          groq: { name: 'Groq', env: 'GROQ_API_KEY', models: 10 },
+          mistral: { name: 'Mistral', env: 'MISTRAL_API_KEY', models: 5 },
+          deepseek: { name: 'DeepSeek', env: 'DEEPSEEK_API_KEY', models: 3 },
+          openrouter: { name: 'OpenRouter', env: 'OPENROUTER_API_KEY', models: 3 },
+          together: { name: 'Together', env: 'TOGETHER_API_KEY', models: 3 },
+          xai: { name: 'xAI', env: 'XAI_API_KEY', models: 3 },
+          cohere: { name: 'Cohere', env: 'COHERE_API_KEY', models: 3 },
+        };
+        const userKeys = parseUserKeys(request.headers.get('x-user-keys'));
+        const providers = {};
+        for (const [id, def] of Object.entries(providerDefs)) {
+          const hasBrowser = !!(userKeys[id]);
+          const hasEnv = !!(env[def.env]);
+          providers[id] = { name: def.name, configured: hasBrowser || hasEnv, models: def.models, source: hasBrowser ? 'browser' : hasEnv ? 'server' : null };
+        }
+        return jsonResp({ keys: keys.results, providers }, 200);
       }
 
       if (path === '/api/keys/generate' && request.method === 'POST') {
