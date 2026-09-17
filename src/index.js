@@ -109,9 +109,11 @@ export default {
         if (!backendUrl) return jsonResp({ status: 'no_backend', backendUrl: null, healthy: false }, 200);
         try {
           const resp = await fetch(backendUrl + '/api/status', { method: 'GET', signal: AbortSignal.timeout(5000) });
-          return jsonResp({ status: 'ok', backendUrl, healthy: resp.ok, code: resp.status }, 200);
+          const updatedAt = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind('backend_url_updated_at').first();
+          return jsonResp({ status: 'ok', backendUrl, healthy: resp.ok, code: resp.status, updatedAt: updatedAt?.value || null }, 200);
         } catch (e) {
-          return jsonResp({ status: 'unreachable', backendUrl, healthy: false, error: e.message }, 200);
+          const updatedAt = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind('backend_url_updated_at').first();
+          return jsonResp({ status: 'unreachable', backendUrl, healthy: false, error: e.message, updatedAt: updatedAt?.value || null }, 200);
         }
       }
 
@@ -251,6 +253,7 @@ export default {
         }
       }
       proxyHeaders.set('Host', tunnelBase.hostname);
+      if (userId) proxyHeaders.set('X-User-Id', String(userId));
       if (finalUserKeys) proxyHeaders.set('X-User-Keys', finalUserKeys);
 
       const proxyReq = new Request(tunnelUrl.toString(), {
@@ -261,9 +264,43 @@ export default {
       });
 
       let resp;
+      let proxyError = null;
       try {
         resp = await fetch(proxyReq, { signal: AbortSignal.timeout(30000) });
       } catch (e) {
+        proxyError = e;
+      }
+
+      // Self-healing: on proxy failure, re-read URL from D1 and retry once
+      if (proxyError) {
+        const freshSetting = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind('backend_url').first();
+        const freshUrl = freshSetting?.value;
+        if (freshUrl && freshUrl !== backendUrl) {
+          console.log(`Self-healing: backend URL changed (${backendUrl} -> ${freshUrl}), retrying...`);
+          const retryTunnelBase = new URL(freshUrl);
+          const retryTunnelUrl = new URL(request.url);
+          retryTunnelUrl.hostname = retryTunnelBase.hostname;
+          retryTunnelUrl.protocol = 'https:';
+          retryTunnelUrl.port = '';
+          retryTunnelUrl.searchParams.delete('token');
+          proxyHeaders.set('Host', retryTunnelBase.hostname);
+          const retryProxyReq = new Request(retryTunnelUrl.toString(), {
+            method: request.method,
+            headers: proxyHeaders,
+            body: request.body,
+            redirect: 'follow',
+          });
+          try {
+            resp = await fetch(retryProxyReq, { signal: AbortSignal.timeout(30000) });
+            proxyError = null;
+          } catch (e2) {
+            proxyError = e2;
+          }
+        }
+      }
+
+      if (proxyError) {
+        const e = proxyError;
         if (path === '/' || path === '') {
           const errResp = makeHtmlResponse(getSetupPage('Backend server is offline. Enter the current tunnel URL.'));
           if (!hasCookie) errResp.headers.append('Set-Cookie', cookieHeader);
